@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get latest BSM release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if (-not (Test-Path "launcher.bat")) {
+            throw "launcher.bat not found."
+          }
+
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+
+          $release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/schrebra/Minecraft-Bedrock-Manager-CSharp/releases/latest" `
+            -Headers $headers
+
+          $asset = $release.assets |
+            Where-Object { $_.name -eq "BedrockServerManager.exe" } |
+            Select-Object -First 1
+
+          if (-not $asset) {
+            throw "BedrockServerManager.exe not found in upstream release."
+          }
+
+          "VERSION=$($release.tag_name)" >> $env:GITHUB_ENV
+          "DOWNLOAD_URL=$($asset.browser_download_url)" >> $env:GITHUB_ENV
+
+      - name: Check existing release
+        id: check
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+
+          $url = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$env:VERSION"
+
+          try {
+            Invoke-RestMethod -Uri $url -Headers $headers | Out-Null
+            Write-Host "Release $env:VERSION already exists. Skipping."
+            "SKIP=true" >> $env:GITHUB_OUTPUT
+          }
+          catch {
+            if ($_.Exception.Response.StatusCode -eq 404) {
+              "SKIP=false" >> $env:GITHUB_OUTPUT
+            }
+            else {
+              throw
+            }
+          }
+
+      - name: Prepare package
+        if: steps.check.outputs.SKIP != 'true'
+        shell: pwsh
+        run: |
+          $build = Join-Path $env:RUNNER_TEMP "BSM"
+          New-Item -ItemType Directory -Path "$build\App" -Force | Out-Null
+
+          Invoke-WebRequest `
+            -Uri "$env:DOWNLOAD_URL" `
+            -OutFile "$build\App\BedrockServerManager.exe"
+
+          $exe = "$build\App\BedrockServerManager.exe"
+
+          if (-not (Test-Path $exe)) {
+            throw "Download failed."
+          }
+
+          if ((Get-Item $exe).Length -eq 0) {
+            throw "Downloaded EXE is empty."
+          }
+
+          Copy-Item "launcher.bat" "$build\launcher.bat"
+
+          $package = "BedrockServerManagerPortable-$env:VERSION.zip"
+
+          Compress-Archive `
+            -Path "$build\launcher.bat", "$build\App" `
+            -DestinationPath $package `
+            -Force
+
+          "PACKAGE=$package" >> $env:GITHUB_ENV
+
+      - name: Create GitHub Release
+        if: steps.check.outputs.SKIP != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: Bedrock Server Manager Portable ${{ env.VERSION }}
+          files: ${{ env.PACKAGE }}
+          body: |
+            Full Changelog:
+            https://github.com/schrebra/Minecraft-Bedrock-Manager-CSharp/commits/${{ env.VERSION }}
